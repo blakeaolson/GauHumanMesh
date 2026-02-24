@@ -37,6 +37,91 @@ loss_fn_vgg = lpips.LPIPS(net='vgg').to(torch.device('cuda', torch.cuda.current_
 
 import time
 import torch.nn.functional as F
+from utils.general_utils import build_rotation
+
+def compute_sugar_regularization_canonical(gaussians, iteration, cache, num_samples=5000, k=16, update_interval=500):
+    """
+    Computes both the SuGaR density loss and normal alignment loss.
+    """
+    means = gaussians.get_xyz 
+    opacities = gaussians.get_opacity
+    scales = gaussians.get_scaling
+    rotations = gaussians.get_rotation
+    
+    num_gaussians = means.shape[0]
+    num_samples = min(num_samples, num_gaussians)
+    
+    if cache.get('knn_idx') is None or (iteration % update_interval == 0):
+        dists = torch.cdist(means, means)
+        _, idx_all = torch.topk(dists, k, dim=-1, largest=False)
+        cache['knn_idx'] = idx_all
+        
+    knn_idx_all = cache['knn_idx']
+    
+    indices = torch.randint(0, num_gaussians, (num_samples,), device="cuda")
+    R_all = build_rotation(rotations) 
+    sampled_means = means[indices]
+    sampled_scales = scales[indices]
+    sampled_R = R_all[indices]
+    
+    z = torch.randn((num_samples, 3, 1), device="cuda")
+    Sz = sampled_scales.unsqueeze(-1) * z 
+    RSz = torch.bmm(sampled_R, Sz).squeeze(-1) 
+    p = sampled_means + RSz
+    
+    idx = knn_idx_all[indices]  
+    
+    nn_means = means[idx]       
+    nn_alphas = opacities[idx]  
+    nn_scales = scales[idx]     
+    nn_R = R_all[idx]           
+    
+    diff = p.unsqueeze(1) - nn_means 
+    diff = diff.unsqueeze(-1)        
+    
+    inv_sq_scales = 1.0 / (nn_scales ** 2 + 1e-6) 
+    v = torch.matmul(nn_R.transpose(-1, -2), diff).squeeze(-1) 
+    power = torch.sum((v ** 2) * inv_sq_scales, dim=-1) 
+    
+    # Actual Density d(p)
+    exp_term = nn_alphas.squeeze(-1) * torch.exp(-0.5 * power)
+    d_p = torch.sum(exp_term, dim=-1)
+    
+    # --- NEW: Analytical Gradient of Density for R_Norm ---
+    # Gradient = sum( alpha * exp(...) * (-Sigma^-1 * (p - mu)) )
+    sigma_inv_diff = torch.matmul(nn_R, (v * inv_sq_scales).unsqueeze(-1)).squeeze(-1)
+    grad_d = torch.sum(exp_term.unsqueeze(-1) * (-sigma_inv_diff), dim=1) 
+    
+    # Normalize gradient to get the smooth surface normal
+    surface_normals = F.normalize(grad_d, p=2, dim=-1) 
+    # ------------------------------------------------------
+    
+    g_star_idx = idx[:, 0]
+    g_star_means = means[g_star_idx]
+    g_star_scales = scales[g_star_idx]
+    g_star_R = R_all[g_star_idx]
+    
+    min_scales, min_idx = torch.min(g_star_scales, dim=-1)
+    batch_indices = torch.arange(num_samples, device="cuda")
+    
+    # n_g is the normal vector of the Gaussian's flat face
+    n_g = g_star_R[batch_indices, :, min_idx] 
+    
+    dot_prod = torch.sum((p - g_star_means) * n_g, dim=-1)
+    
+    power_bar = (dot_prod ** 2) / (min_scales ** 2 + 1e-6)
+    d_bar_p = torch.exp(-0.5 * power_bar) 
+    
+    # 1. Density Loss
+    density_loss = torch.mean(torch.abs(d_p - d_bar_p))
+    
+    # 2. Normal Alignment Loss (R_Norm)
+    # We penalize 1.0 - absolute dot product to handle sign ambiguity 
+    # (n_g and -n_g represent the same physical Gaussian orientation)
+    alignment = torch.sum(surface_normals * n_g, dim=-1)
+    normal_loss = torch.mean(1.0 - torch.abs(alignment))
+    
+    return density_loss, normal_loss
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
@@ -62,7 +147,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     lpips_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-
+    sugar_cache = {'knn_idx': None}
     # lpips_test_lst = []
 
     elapsed_time = 0
@@ -121,6 +206,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         lpips_loss = loss_fn_vgg(img_pred, img_gt).reshape(-1)
 
         loss = Ll1 + 0.1 * mask_loss + 0.01 * (1.0 - ssim_loss) + 0.01 * lpips_loss
+
+        # density regularization SuGaR loss
+        sugar_start_iter = 1200
+        
+        if iteration == sugar_start_iter:
+            print(f"\n[ITER {iteration}] Initiating SuGaR Fine-Tuning.")
+            prune_mask = (gaussians.get_opacity > 0.5).squeeze()
+            gaussians.prune_points(prune_mask)
+            sugar_cache['knn_idx'] = None
+            
+        if iteration >= sugar_start_iter:
+            density_loss, normal_loss = compute_sugar_regularization_canonical(
+                gaussians, 
+                iteration=iteration, 
+                cache=sugar_cache, 
+                num_samples=5000, 
+                k=16, 
+                update_interval=500
+            )            
+            loss += 0.1 * density_loss
+            if iteration % 500 == 0:
+                print("[ITER {}] SuGaR Density Loss: {:.6f}, Normal Loss: {:.6f}".format(iteration, density_loss.item(), normal_loss.item()))
+
         loss.backward()
 
         # end time
